@@ -25,7 +25,7 @@ class PDFReader(QMainWindow):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('正则 PDF 阅读器 - 页面跳转版')
+        self.setWindowTitle('正则 PDF 阅读器')
         self.resize(1200, 800)
 
         central_widget = QWidget()
@@ -190,8 +190,15 @@ class PDFReader(QMainWindow):
                 self.doc = fitz.open(filename)
                 self.current_page = 0
                 self.results_list.clear()
+                self.result_count_label.setText('共 0 条匹配结果')
+                self.active_data = None
+                
+                # 👇 就是这一行！把它加回来，标题栏就会恢复显示路径和文件名了
+                self.setWindowTitle(f'正则 PDF 阅读器 - {filename}')
+                
                 self.setup_pages_layout()
-            except Exception as e: QMessageBox.critical(self, '错误', str(e))
+            except Exception as e:
+                QMessageBox.critical(self, '错误', f'无法打开文件: {str(e)}')
 
     def setup_pages_layout(self):
         if not self.doc: return
