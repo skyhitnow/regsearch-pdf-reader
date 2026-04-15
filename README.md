@@ -31,7 +31,7 @@
 3. **运行程序**：
 	Bash
 	```
-	python pdf_reader.py
+	python pdfsearch.py
 	```
 
 ## 📖 使用说明
