@@ -469,8 +469,25 @@ class PDFReader(QMainWindow):
         for res in page_results:
             is_active = (self.active_data and self.active_data == res)
             
-            # 使用提取出的单字物理框进行原生高亮绘制
-            quads = [r.quad for r in res['rects']]
+            # --- 核心新增：同行单字框合并逻辑 ---
+            merged_rects = []
+            if res['rects']:
+                curr_rect = fitz.Rect(res['rects'][0]) # 取出第一个字的框
+                for r in res['rects'][1:]:
+                    # 判断当前字和下一个字是否在“同一行”
+                    # 如果它们在垂直方向上有交集 (y坐标重叠)
+                    if curr_rect.y0 < r.y1 and curr_rect.y1 > r.y0:
+                        # 使用 | 运算符，求两个框的并集（自动扩展成一个大长条）
+                        curr_rect |= r 
+                    else:
+                        # 如果换行了，就把刚才那行的大长条存起来，开启新的一行
+                        merged_rects.append(curr_rect)
+                        curr_rect = fitz.Rect(r)
+                merged_rects.append(curr_rect) # 把最后一行存进去
+            # ------------------------------------
+
+            # 把合并后的大框（通常一行就是一个大长条）转换回 quads 交给引擎渲染
+            quads = [r.quad for r in merged_rects]
             if quads:
                 annot = page.add_highlight_annot(quads)
                 if annot:
