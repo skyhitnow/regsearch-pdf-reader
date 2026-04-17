@@ -6,9 +6,120 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QLabel, 
                              QScrollArea, QFileDialog, QMessageBox, QSplitter, 
                              QSlider, QComboBox, QInputDialog, QLineEdit)
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import Qt, QSettings, QTimer
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
+from PyQt5.QtCore import Qt, QSettings, QTimer, QRect
 
+# ==========================================
+# 自定义标签类：实现字符级精准文本选择 (修复完全无法选择的 Bug)
+# ==========================================
+class SmartTextLabel(QLabel):
+    def __init__(self, doc, page_num, zoom_factor, parent=None):
+        super().__init__(parent)
+        self.doc = doc
+        self.page_num = page_num
+        self.zoom_factor = zoom_factor
+        
+        self.chars = []
+        # 【关键修复】：必须使用 "rawdict" 才能精确提取到每一个单字（char）的坐标
+        page_dict = self.doc[self.page_num].get_text("rawdict")
+        for block in page_dict.get("blocks", []):
+            # type == 0 代表这是纯文本块（过滤掉图片块，防止报错）
+            if block.get("type") == 0:
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        for c in span.get("chars", []):
+                            # 保存每个单字的内容和它的精确边界框
+                            self.chars.append({
+                                'rect': fitz.Rect(c['bbox']),
+                                'c': c['c']
+                            })
+        
+        # 记录选中区域的起点字符索引和终点字符索引
+        self.start_idx = None
+        self.current_idx = None
+
+    def get_closest_char_idx(self, x, y):
+        """核心算法：计算鼠标当前坐标落在了哪个字的头上"""
+        if not self.chars:
+            return None
+            
+        z = self.zoom_factor
+        pdf_pos = fitz.Point(x / z, y / z)
+        
+        min_dist = float('inf')
+        closest_idx = None
+
+        for i, char_info in enumerate(self.chars):
+            r = char_info['rect']
+            # 如果鼠标直接点在字的内部，立刻返回该字
+            if r.contains(pdf_pos):
+                return i
+            
+            # 如果鼠标点在字的边缘，计算到字中心的距离
+            cx = (r.x0 + r.x1) / 2
+            cy = (r.y0 + r.y1) / 2
+            dist = (cx - pdf_pos.x)**2 + (cy - pdf_pos.y)**2
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+
+        # 如果距离某个字足够近（容错范围），则判定为选中该字
+        if min_dist < 400: 
+            return closest_idx
+        return None
+
+    def mousePressEvent(self, event):
+        """鼠标按下：锁定选区的起始字符"""
+        if event.button() == Qt.LeftButton:
+            self.start_idx = self.get_closest_char_idx(event.pos().x(), event.pos().y())
+            self.current_idx = self.start_idx
+            self.update() 
+
+    def mouseMoveEvent(self, event):
+        """鼠标拖拽：更新选区的结束字符并重绘"""
+        if self.start_idx is not None:
+            self.current_idx = self.get_closest_char_idx(event.pos().x(), event.pos().y())
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        """鼠标松开：执行线性复制"""
+        if event.button() == Qt.LeftButton and self.start_idx is not None:
+            self.current_idx = self.get_closest_char_idx(event.pos().x(), event.pos().y())
+            self.update()
+            
+            # 将起点和终点之间的所有字拼接起来
+            if self.start_idx is not None and self.current_idx is not None:
+                start = min(self.start_idx, self.current_idx)
+                end = max(self.start_idx, self.current_idx)
+                text = "".join([self.chars[i]['c'] for i in range(start, end + 1)])
+                if text:
+                    QApplication.clipboard().setText(text)
+            
+            # 复制完毕，清除记录但保留屏幕高亮
+            self.start_idx = None
+            self.current_idx = None
+
+    def paintEvent(self, event):
+        """重写绘制事件：从起点字到终点字，逐字画上蓝色高亮"""
+        super().paintEvent(event) 
+        
+        if self.start_idx is not None and self.current_idx is not None:
+            painter = QPainter(self)
+            painter.setBrush(QColor(0, 120, 215, 100)) 
+            painter.setPen(Qt.NoPen)
+            z = self.zoom_factor
+            
+            start = min(self.start_idx, self.current_idx)
+            end = max(self.start_idx, self.current_idx)
+            
+            for i in range(start, end + 1):
+                r = self.chars[i]['rect']
+                painter.drawRect(int(r.x0 * z), int(r.y0 * z), 
+                                 int((r.x1 - r.x0) * z), int((r.y1 - r.y0) * z))
+
+# ==========================================
+# 主阅读器类
+# ==========================================
 class PDFReader(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -18,17 +129,15 @@ class PDFReader(QMainWindow):
         self.search_results_data = [] 
         self.active_data = None
         
-        # 【配置】：使用本地文件存储预设，实现绿色便携化
         self.settings = QSettings("pdfsearch-config.ini", QSettings.IniFormat) 
         
-        # 连续滚动状态
         self.page_labels = []   
         self.rendered_pages = set() 
         
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('高级正则 PDF 阅读器')
+        self.setWindowTitle('正则 PDF 阅读器 (原生文字选择版)')
         self.resize(1200, 800)
 
         central_widget = QWidget()
@@ -38,7 +147,7 @@ class PDFReader(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
-        # --- 左侧面板：搜索与预设管理 ---
+        # --- 左侧面板 ---
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
@@ -48,14 +157,12 @@ class PDFReader(QMainWindow):
 
         left_layout.addWidget(QLabel('正则表达式预设 (只显示名称):'))
         
-        # 预设按钮组
         search_nav_layout = QHBoxLayout()
         self.search_combo = QComboBox()
         self.search_combo.activated.connect(self.on_preset_selected)
         self.search_combo.currentIndexChanged.connect(self.on_preset_selected)
         search_nav_layout.addWidget(self.search_combo, 4)
         
-        # 【恢复】：添加和删除按钮
         self.btn_add_preset = QPushButton('添加')
         self.btn_add_preset.clicked.connect(self.add_preset)
         search_nav_layout.addWidget(self.btn_add_preset, 1)
@@ -65,11 +172,10 @@ class PDFReader(QMainWindow):
         search_nav_layout.addWidget(self.btn_del_preset, 1)
         left_layout.addLayout(search_nav_layout)
 
-        # 当前正则编辑框
         regex_input_layout = QHBoxLayout()
         regex_input_layout.addWidget(QLabel('当前正则:'))
         self.current_regex_input = QLineEdit()
-        self.current_regex_input.setPlaceholderText('请选择预设或直接输入正则...')
+        self.current_regex_input.setPlaceholderText('请选择或输入正则...')
         self.current_regex_input.returnPressed.connect(self.perform_search)
         regex_input_layout.addWidget(self.current_regex_input)
         left_layout.addLayout(regex_input_layout)
@@ -85,7 +191,7 @@ class PDFReader(QMainWindow):
         self.results_list.currentItemChanged.connect(self.on_result_change)
         left_layout.addWidget(self.results_list)
 
-        # --- 右侧面板：工具栏与 PDF 视图 ---
+        # --- 右侧面板 ---
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
@@ -100,7 +206,6 @@ class PDFReader(QMainWindow):
         toolbar.addWidget(self.page_label)
         toolbar.addWidget(self.btn_next)
         
-        # 页面跳转
         toolbar.addSpacing(20)
         toolbar.addWidget(QLabel('跳转到:'))
         self.page_jump_input = QLineEdit()
@@ -113,13 +218,11 @@ class PDFReader(QMainWindow):
         
         toolbar.addStretch(1) 
         
-        # 视图模式
         self.view_mode_combo = QComboBox()
         self.view_mode_combo.addItems(["单页显示", "连续显示"])
         self.view_mode_combo.currentIndexChanged.connect(self.change_view_mode)
         toolbar.addWidget(self.view_mode_combo)
         
-        # 缩放控制
         toolbar.addWidget(QLabel('缩放:'))
         self.zoom_slider = QSlider(Qt.Horizontal)
         self.zoom_slider.setRange(5, 40)
@@ -130,7 +233,6 @@ class PDFReader(QMainWindow):
         
         right_layout.addLayout(toolbar)
         
-        # PDF 滚动显示容器
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("QScrollArea { background-color: #525659; border: none; }")
@@ -160,14 +262,12 @@ class PDFReader(QMainWindow):
                 self.results_list.clear()
                 self.result_count_label.setText('共 0 条匹配结果')
                 self.active_data = None
-                # 【恢复】：标题栏显示文件路径
                 self.setWindowTitle(f'正则 PDF 阅读器 - {filename}')
                 self.setup_pages_layout()
             except Exception as e:
                 QMessageBox.critical(self, '错误', f'无法打开文件: {str(e)}')
 
     def load_presets(self):
-        """从本地 .ini 加载预设"""
         self.search_combo.clear()
         presets = self.settings.value("regex_presets", [])
         if presets:
@@ -177,7 +277,6 @@ class PDFReader(QMainWindow):
             self.current_regex_input.clear()
 
     def save_presets(self):
-        """保存预设到本地 .ini"""
         presets = []
         for i in range(self.search_combo.count()):
             presets.append({"name": self.search_combo.itemText(i), "regex": self.search_combo.itemData(i)})
@@ -227,15 +326,86 @@ class PDFReader(QMainWindow):
         self.results_list.blockSignals(False)
 
         for page_num in range(len(self.doc)):
-            text = self.doc[page_num].get_text("text")
-            occurrences = {}
-            for match in regex.finditer(text):
+            page = self.doc[page_num]
+            
+            # --- 全新架构：底层字符级映射 ---
+            page_dict = page.get_text("rawdict")
+            raw_chars = []
+            
+            # 1. 提取所有单字和它对应的物理框
+            for block in page_dict.get("blocks", []):
+                if block.get("type") == 0:
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            for c in span.get("chars", []):
+                                raw_chars.append((c['c'], fitz.Rect(c['bbox'])))
+                        # 在每行末尾人工插入一个换行符，并给个空坐标
+                        raw_chars.append(('\n', fitz.Rect(0,0,0,0)))
+            
+            # 2. 执行智能压平，同时保持坐标数组完美对齐
+            clean_chars = []
+            for i, (ch, rect) in enumerate(raw_chars):
+                if ch == '\n':
+                    prev_ch = raw_chars[i-1][0] if i > 0 else ' '
+                    next_ch = raw_chars[i+1][0] if i < len(raw_chars)-1 else ' '
+                    
+                    # 判断前后是否为非 ASCII 字符（如中文）
+                    prev_is_cn = ord(prev_ch) > 255 if prev_ch else False
+                    next_is_cn = ord(next_ch) > 255 if next_ch else False
+                    
+                    if prev_is_cn and next_is_cn:
+                        # 中文跨行：丢弃换行符（文字和坐标一起丢弃）
+                        continue
+                    else:
+                        # 英文跨行：换行符转为空格
+                        clean_chars.append((' ', rect))
+                else:
+                    clean_chars.append((ch, rect))
+                    
+            clean_text = "".join([c[0] for c in clean_chars])
+            char_rects = [c[1] for c in clean_chars]
+            
+            seen_rects = []
+            
+            # 3. 在完全压平的纯文本上执行正则搜索
+            for match in regex.finditer(clean_text):
                 m_str = match.group()
-                occ_idx = occurrences.get(m_str, 0)
-                occurrences[m_str] = occ_idx + 1
-                snippet = text[max(0, match.start()-10):min(len(text), match.end()+10)].replace('\n', ' ')
+                if not m_str: continue
+                
+                start_idx = match.start()
+                end_idx = match.end()
+                
+                # 获取匹配项首字的物理坐标用于去重验证
+                first_rect = char_rects[start_idx]
+                if first_rect.get_area() == 0: # 防空坐标异常
+                    for r in char_rects[start_idx:end_idx]:
+                        if r.get_area() > 0:
+                            first_rect = r
+                            break
+                            
+                # 重影文本检测
+                is_duplicate = False
+                for seen_rect in seen_rects:
+                    if first_rect.get_area() > 0 and (first_rect & seen_rect).get_area() > 0.5 * first_rect.get_area():
+                        is_duplicate = True
+                        break
+                
+                if is_duplicate:
+                    continue
+                    
+                seen_rects.append(first_rect)
+                
+                # 【终极大招】：直接提取这些字的精准物理框并保存，彻底抛弃 search_for
+                match_rects = [r for r in char_rects[start_idx:end_idx] if r.get_area() > 0]
+                
+                snippet = clean_text[max(0, start_idx-10):min(len(clean_text), end_idx+10)]
                 self.results_list.addItem(f"P{page_num+1}: ...{snippet}...")
-                self.search_results_data.append({'page': page_num, 'str': m_str, 'occ_idx': occ_idx})
+                
+                self.search_results_data.append({
+                    'page': page_num, 
+                    'str': m_str, 
+                    'rects': match_rects # 直接传递坐标数组
+                })
 
         self.result_count_label.setText(f'共找到 {len(self.search_results_data)} 条匹配结果')
         if self.search_results_data:
@@ -243,7 +413,6 @@ class PDFReader(QMainWindow):
         self.rendered_pages.clear()
         self.render_visible_pages()
 
-    # 【恢复】：切换显示模式逻辑
     def change_view_mode(self):
         self.setup_pages_layout()
         if self.active_data:
@@ -260,14 +429,17 @@ class PDFReader(QMainWindow):
         self.rendered_pages.clear()
         is_continuous = (self.view_mode_combo.currentIndex() == 1)
         pages_to_show = range(len(self.doc)) if is_continuous else [self.current_page]
+        
         for p in pages_to_show:
-            lbl = QLabel()
+            # --- 使用我们自定义的带选中功能的标签 ---
+            lbl = SmartTextLabel(self.doc, p, self.zoom_factor)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("background-color: white;")
             rect = self.doc[p].rect
             lbl.setFixedSize(int(rect.width * self.zoom_factor), int(rect.height * self.zoom_factor))
             self.pdf_layout.addWidget(lbl)
             self.page_labels.append((p, lbl))
+            
         self.update_nav_buttons()
         QTimer.singleShot(0, self.render_visible_pages)
 
@@ -276,7 +448,6 @@ class PDFReader(QMainWindow):
         self.update_current_page_by_scroll()
 
     def render_visible_pages(self):
-        """懒加载核心"""
         if not self.doc or not self.page_labels: return
         v_top = self.scroll_area.verticalScrollBar().value()
         v_bottom = v_top + self.scroll_area.viewport().height()
@@ -294,15 +465,19 @@ class PDFReader(QMainWindow):
         page = self.doc[page_num]
         temp_annots = []
         page_results = [res for res in self.search_results_data if res['page'] == page_num]
+        
         for res in page_results:
-            rects = page.search_for(res['str'])
-            if rects:
-                idx = min(res['occ_idx'], len(rects) - 1)
-                is_active = (self.active_data and self.active_data == res)
-                annot = page.add_highlight_annot(rects[idx])
-                annot.set_colors(stroke=(1.0, 0.4, 0.0) if is_active else (1.0, 1.0, 0.0))
-                annot.update()
-                temp_annots.append(annot)
+            is_active = (self.active_data and self.active_data == res)
+            
+            # 使用提取出的单字物理框进行原生高亮绘制
+            quads = [r.quad for r in res['rects']]
+            if quads:
+                annot = page.add_highlight_annot(quads)
+                if annot:
+                    annot.set_colors(stroke=(1.0, 0.4, 0.0) if is_active else (1.0, 1.0, 0.0))
+                    annot.update()
+                    temp_annots.append(annot)
+                    
         pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom_factor, self.zoom_factor))
         for a in temp_annots: page.delete_annot(a)
         fmt = QImage.Format_RGBA8888 if pix.alpha else QImage.Format_RGB888
@@ -371,11 +546,12 @@ class PDFReader(QMainWindow):
             if p == self.active_data['page']:
                 label_y = lbl.y()
                 break
-        rects = self.doc[self.active_data['page']].search_for(self.active_data['str'])
-        if rects:
-            idx = min(self.active_data['occ_idx'], len(rects)-1)
-            y_in_page = int(rects[idx].y0 * self.zoom_factor)
-            self.scroll_area.verticalScrollBar().setValue(label_y + y_in_page - 100)
+                
+        if self.active_data['rects']:
+            # 获取第一个非空字符的 y0 坐标，直接计算滚动条位置
+            y_in_page = int(self.active_data['rects'][0].y0 * self.zoom_factor)
+            self.scroll_area.verticalScrollBar().setValue(int(label_y + y_in_page - 100))
+            
         self.render_visible_pages()
         self.update_nav_buttons()
 
