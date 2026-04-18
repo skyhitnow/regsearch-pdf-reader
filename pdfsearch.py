@@ -5,9 +5,11 @@ import fitz  # PyMuPDF
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QListWidget, QLabel, 
                              QScrollArea, QFileDialog, QMessageBox, QSplitter, 
-                             QSlider, QComboBox, QInputDialog, QLineEdit, QAction, QListWidgetItem)
+                             QSlider, QComboBox, QInputDialog, QLineEdit, QAction, 
+                             QTreeWidgetItem, QTreeWidget) #
+
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
-from PyQt5.QtCore import Qt, QSettings
+from PyQt5.QtCore import Qt, QSettings,QTimer
 
 # ==========================================
 # 自定义标签类：实现字符级精准文本选择
@@ -92,6 +94,9 @@ class PDFReader(QMainWindow):
         self.search_results_data = []
         self.active_data = None
         self.all_bookmarks = [] 
+
+        # 【新增】：模式切换状态
+        self.is_continuous_mode = False
         
         self.settings = QSettings("pdfsearch-config.ini", QSettings.IniFormat)
         self.page_labels = []
@@ -107,35 +112,38 @@ class PDFReader(QMainWindow):
 
         # --- 菜单栏 ---
         menubar = self.menuBar()
-        file_menu = menubar.addMenu('文件')
         
-        # 1. 打开
+        # 1. 文件菜单 (保留你之前的)
+        file_menu = menubar.addMenu('文件')
         open_act = QAction('打开', self)
         open_act.setShortcut('Ctrl+O')
         open_act.triggered.connect(self.open_file)
         
-        # 2. 【新增】直接保存
         save_act = QAction('保存', self)
-        save_act.setShortcut('Ctrl+S') # 绑定 Ctrl+S 快捷键
+        save_act.setShortcut('Ctrl+S')
         save_act.triggered.connect(self.direct_save)
         
-        # 3. 另存为
         save_as_act = QAction('另存为', self)
         save_as_act.setShortcut('Ctrl+Shift+S')
         save_as_act.triggered.connect(self.save_as_file)
         
-        # 4. 关闭
         close_act = QAction('关闭', self)
         close_act.setShortcut('Ctrl+W')
         close_act.triggered.connect(self.close_file)
         
-        # 按照标准顺序添加
         file_menu.addAction(open_act)
-        file_menu.addSeparator() # 加一根分割线更好看
+        file_menu.addSeparator()
         file_menu.addAction(save_act)
         file_menu.addAction(save_as_act)
         file_menu.addSeparator()
         file_menu.addAction(close_act)
+
+        # 2. 【新增】：编辑菜单（专治各种快捷键失效）
+        edit_menu = menubar.addMenu('编辑')
+        find_act = QAction('搜索正文', self)
+        find_act.setShortcut('Ctrl+F') # 绑定在这，绝对有效
+        find_act.triggered.connect(self.focus_search_box)
+        edit_menu.addAction(find_act)
 
         # 主布局使用 Splitter
         self.main_splitter = QSplitter(Qt.Horizontal)
@@ -163,9 +171,18 @@ class PDFReader(QMainWindow):
         bookmark_layout.addWidget(self.bookmark_search)
         
         # 书签列表
-        self.bookmark_list = QListWidget()
-        self.bookmark_list.itemClicked.connect(self.on_bookmark_clicked)
-        bookmark_layout.addWidget(self.bookmark_list)
+        # --- 原本是 self.bookmark_list = QListWidget()，现在替换为： ---
+        self.bookmark_tree = QTreeWidget()
+        self.bookmark_tree.setHeaderLabels(["名称", "页码"]) # 设置表头
+        self.bookmark_tree.setColumnWidth(0, 140)       # 给名字留宽一点
+        self.bookmark_tree.setRootIsDecorated(False)    # 隐藏树形控件前面的折叠箭头留白
+        self.bookmark_tree.setIndentation(0)
+        
+        self.bookmark_tree.itemClicked.connect(self.on_bookmark_clicked)
+        # 绑定编辑完成后的信号
+        self.bookmark_tree.itemChanged.connect(self.on_bookmark_edited)
+        
+        bookmark_layout.addWidget(self.bookmark_tree)
 
        # --- 2. 中间面板：文档预览 ---
         self.center_panel = QWidget()
@@ -194,8 +211,12 @@ class PDFReader(QMainWindow):
         self.btn_jump = QPushButton('跳转')
         self.btn_jump.clicked.connect(self.jump_to_page_from_input)
         mid_toolbar.addWidget(self.btn_jump)
-        
-        mid_toolbar.addStretch(1) # 右侧隐形弹簧，把缩放区死死顶在最右边
+
+        # 【新增】：模式切换按钮
+        mid_toolbar.addSpacing(20)
+        self.btn_toggle_mode = QPushButton('连续滚动')
+        self.btn_toggle_mode.clicked.connect(self.toggle_view_mode)
+        mid_toolbar.addWidget(self.btn_toggle_mode)
         
         mid_toolbar.addStretch(1) # 右侧隐形弹簧，把缩放区死死顶在最右边
         
@@ -240,7 +261,7 @@ class PDFReader(QMainWindow):
         search_layout.addWidget(QLabel("<b>正则搜索</b>"))
         
         self.search_combo = QComboBox()
-        self.search_combo.currentIndexChanged.connect(self.on_preset_selected)
+        self.search_combo.currentIndexChanged.connect(self.on_presets_selected)
         search_layout.addWidget(self.search_combo)
         
         reg_btn_layout = QHBoxLayout()
@@ -271,6 +292,13 @@ class PDFReader(QMainWindow):
         self.main_splitter.addWidget(self.search_panel)
         self.main_splitter.setSizes([200, 800, 300])
 
+
+    def focus_search_box(self):
+            """当按下 Ctrl+F 时，让正则输入框获取焦点并全选现有文字"""
+            # 强制抢夺焦点，无视其他控件的阻挡
+            self.current_regex_input.setFocus(Qt.ShortcutFocusReason)
+            self.current_regex_input.selectAll()
+
     # --- 书签逻辑 ---
     # ==========================================
     # --- 替换以下关于书签和保存的 6 个函数 ---
@@ -300,39 +328,73 @@ class PDFReader(QMainWindow):
         # 将目录树写回 PDF 内存对象
         self.doc.set_toc(toc)
 
+    def render_bookmark_list(self, filter_text=""):
+        self.bookmark_tree.blockSignals(True) # 暂时屏蔽信号，防止在生成列表时触发编辑事件
+        self.bookmark_tree.clear()
+        
+        for i, bk in enumerate(self.all_bookmarks):
+            if filter_text.lower() in bk['name'].lower():
+                # 分两列放入：名称 和 页码
+                item = QTreeWidgetItem([bk['name'], f"P{bk['page']+1}"])
+                item.setData(0, Qt.UserRole, i)
+                
+                # 【核心】：赋予第一列（名称）可双击编辑的权限！
+                item.setFlags(item.flags() | Qt.ItemIsEditable) 
+                
+                self.bookmark_tree.addTopLevelItem(item)
+                
+        self.bookmark_tree.blockSignals(False)
+
     def add_bookmark(self):
+        """点击添加，直接新增一行并立刻进入编辑状态"""
         if not self.doc: return
-        name, ok = QInputDialog.getText(self, "添加书签", "书签名称:", text=f"书签 {len(self.all_bookmarks)+1}")
-        if ok and name:
-            self.all_bookmarks.append({"name": name, "page": self.current_page})
-            self.sync_bookmarks_to_doc() # 立刻写入内存中的 PDF 结构
-            self.render_bookmark_list()
+        
+        # 默认给个占位名字，不弹窗！
+        new_name = f"新书签 {len(self.all_bookmarks)+1}"
+        self.all_bookmarks.append({"name": new_name, "page": self.current_page})
+        self.sync_bookmarks_to_doc()
+        self.render_bookmark_list()
+        
+        # 找到刚刚新增的那一行（最后一行），并用代码模拟双击，强制它立刻进入输入状态！
+        last_item = self.bookmark_tree.topLevelItem(self.bookmark_tree.topLevelItemCount() - 1)
+        if last_item:
+            self.bookmark_tree.setCurrentItem(last_item)
+            self.bookmark_tree.editItem(last_item, 0)
+
+    def on_bookmark_edited(self, item, column):
+        """当用户双击修改完文字，按下回车或点击空白处时触发"""
+        if column == 0: 
+            idx = item.data(0, Qt.UserRole)
+            new_name = item.text(0).strip()
+            
+            # 如果用户把名字删光了，强行给个名字防止变空
+            if not new_name: 
+                new_name = "未命名"
+                item.setText(0, new_name)
+                
+            # 只有名字真变了才去保存
+            if self.all_bookmarks[idx]['name'] != new_name:
+                self.all_bookmarks[idx]['name'] = new_name
+                self.sync_bookmarks_to_doc()
 
     def delete_bookmark(self):
         if not self.doc: return
-        row = self.bookmark_list.currentRow()
-        if row >= 0:
-            original_idx = self.bookmark_list.item(row).data(Qt.UserRole)
-            del self.all_bookmarks[original_idx]
-            self.sync_bookmarks_to_doc() # 立刻更新内存中的 PDF 结构
+        item = self.bookmark_tree.currentItem()
+        if item:
+            idx = item.data(0, Qt.UserRole)
+            del self.all_bookmarks[idx]
+            self.sync_bookmarks_to_doc()
             self.render_bookmark_list()
 
-    def render_bookmark_list(self, filter_text=""):
-        self.bookmark_list.clear()
-        for i, bk in enumerate(self.all_bookmarks):
-            if filter_text.lower() in bk['name'].lower():
-                item = QListWidgetItem(f"{bk['name']} (P{bk['page']+1})")
-                item.setData(Qt.UserRole, i)
-                self.bookmark_list.addItem(item)
+    def on_bookmark_clicked(self, item, column):
+            """单击条目立刻跳转"""
+            idx = item.data(0, Qt.UserRole)
+            # 修改为调用 go_to_page
+            self.go_to_page(self.all_bookmarks[idx]['page'])
 
 
     def filter_bookmarks(self, text):
         self.render_bookmark_list(text)
-
-    def on_bookmark_clicked(self, item):
-        idx = item.data(Qt.UserRole)
-        self.current_page = self.all_bookmarks[idx]['page']
-        self.setup_pages_layout()
 
     # --- 文件操作 ---
     def open_file(self):
@@ -349,7 +411,7 @@ class PDFReader(QMainWindow):
             self.setWindowTitle(f"高级正则 PDF 阅读器 - {os.path.basename(path)}")
 
     def close_file(self):
-        """关闭当前文档并彻底清空所有相关的 UI 元素"""
+        """关闭当前文档并彻底清空所有相关的 UI 和底层数据"""
         if self.doc:
             self.doc.close()
             self.doc = None
@@ -361,15 +423,17 @@ class PDFReader(QMainWindow):
         if hasattr(self, 'page_jump_input'):
             self.page_jump_input.clear()
 
-        # 2. 【核心修改】：彻底清空书签相关内容
-        self.all_bookmarks = []            # 清空内部数据列表
-        self.bookmark_list.clear()         # 清空左侧列表控件
-        self.bookmark_search.clear()       # 清空书签搜索框
+        # 2. 彻底清空书签相关内容
+        self.all_bookmarks = []            
+        self.bookmark_tree.clear()         
+        self.bookmark_search.clear()       
 
-        # 3. 清空右侧正则搜索相关内容
+        # 3. 【核心修复】：彻底清空正则搜索相关的 UI 与 底层数据
         self.results_list.clear()
         self.result_count_label.setText('共 0 条结果')
+        self.search_results_data = []      # <--- 就是漏了这一行！必须清空旧坐标！
         self.active_data = None
+        self.current_regex_input.clear()   # 顺手把搜索框里的字也清掉，保持界面整洁
         
         # 4. 清空中间 PDF 渲染视图
         while self.pdf_layout.count():
@@ -416,9 +480,27 @@ class PDFReader(QMainWindow):
 
     # --- 搜索逻辑 ---
     def load_presets(self):
+        """加载预设，并自动恢复上一次选中的项"""
+        self.search_combo.blockSignals(True) # 暂时屏蔽信号，防止清空时触发误操作
         self.search_combo.clear()
+        
         presets = self.settings.value("regex_presets", [])
-        for p in presets: self.search_combo.addItem(p['name'], p['regex'])
+        for p in presets:
+            self.search_combo.addItem(p['name'])
+            
+        # 【核心新增】：读取上一次保存的索引，默认值为 0
+        last_idx = self.settings.value("last_preset_index", 0, type=int)
+        
+        # 确保索引合法（防止预设被删后越界）
+        if 0 <= last_idx < self.search_combo.count():
+            self.search_combo.setCurrentIndex(last_idx)
+            # 同步把正则文本填入搜索框
+            self.current_regex_input.setText(presets[last_idx]['regex'])
+        elif self.search_combo.count() > 0:
+            self.search_combo.setCurrentIndex(0)
+            self.current_regex_input.setText(presets[0]['regex'])
+            
+        self.search_combo.blockSignals(False)
 
     def add_preset(self):
         # 第一步：只询问名称
@@ -488,23 +570,39 @@ class PDFReader(QMainWindow):
                 self.settings.setValue("regex_presets", presets)
                 self.load_presets()
 
-    def on_preset_selected(self, idx):
-        if idx >= 0: self.current_regex_input.setText(self.search_combo.itemData(idx))
+    def on_presets_selected(self, idx):
+        """下拉框切换时触发：更新输入框，并记住当前选择"""
+        if idx >= 0:
+            presets = self.settings.value("regex_presets", [])
+            if idx < len(presets):
+                # 1. 更新文本框里的正则表达式
+                self.current_regex_input.setText(presets[idx]['regex'])
+                
+                # 2. 【核心】：将当前索引永久写入本地配置文件
+                self.settings.setValue("last_preset_index", idx)
+
+    
 
     def perform_search(self):
         if not self.doc: return
         pattern = self.current_regex_input.text()
-        if not pattern: return
-        try: regex = re.compile(pattern)
-        except Exception as e:
-            QMessageBox.warning(self, '语法错误', str(e))
-            return
         
         self.results_list.clear()
         self.search_results_data.clear()
         self.active_data = None
         
-        # 恢复之前完美的：底层坐标级精准跨行搜索逻辑
+        if not pattern: 
+            self.result_count_label.setText("共 0 条结果")
+            self.setup_pages_layout()
+            return
+            
+        try: regex = re.compile(pattern)
+        except Exception as e:
+            QMessageBox.warning(self, '语法错误', str(e))
+            return
+        
+        res_id_counter = 0 # 【终极修复 1】：给每个结果分配全局唯一的整数 ID
+        
         for page_num in range(len(self.doc)):
             page = self.doc[page_num]
             page_dict = page.get_text("rawdict")
@@ -523,12 +621,9 @@ class PDFReader(QMainWindow):
                 if ch == '\n':
                     prev_ch = raw_chars[i-1][0] if i > 0 else ' '
                     next_ch = raw_chars[i+1][0] if i < len(raw_chars)-1 else ' '
-                    if (ord(prev_ch) > 255) and (ord(next_ch) > 255):
-                        continue
-                    else:
-                        clean_chars.append((' ', rect))
-                else:
-                    clean_chars.append((ch, rect))
+                    if (ord(prev_ch) > 255) and (ord(next_ch) > 255): continue
+                    else: clean_chars.append((' ', rect))
+                else: clean_chars.append((ch, rect))
                     
             clean_text = "".join([c[0] for c in clean_chars])
             seen_rects = []
@@ -555,57 +650,138 @@ class PDFReader(QMainWindow):
                 if is_duplicate: continue
                 
                 seen_rects.append(first_rect)
-                
                 match_rects = [c[1] for c in clean_chars[start_idx:end_idx] if c[1].get_area() > 0]
                 snippet = clean_text[max(0, start_idx-10):min(len(clean_text), end_idx+10)]
                 
                 self.results_list.addItem(f"P{page_num+1}: ...{snippet}...")
                 self.search_results_data.append({
+                    'id': res_id_counter, # 存入唯一 ID
                     'page': page_num, 
                     'str': m_str, 
-                    'rects': match_rects # 恢复将物理坐标存入结果
+                    'rects': match_rects 
                 })
+                res_id_counter += 1 # ID自增
 
         self.result_count_label.setText(f"共 {len(self.search_results_data)} 条结果")
+        self.setup_pages_layout()
         if self.search_results_data:
             self.results_list.setCurrentRow(0)
 
     def on_result_change(self, cur, prev):
         if cur:
+            # 记录旧页码
+            old_page = self.active_data['page'] if self.active_data else None
+            
+            # 更新当前激活的数据
             res = self.search_results_data[self.results_list.row(cur)]
-            self.active_data = res # 必须设置 active_data，才能显示深橙色的选中状态
-            self.current_page = res['page']
-            self.setup_pages_layout()
+            self.active_data = res 
+            new_page = res['page']
+            
+            # 【修复 1：顺序至关重要】必须先执行跳转！
+            # 这样在单页模式下，目标页才会被创建出来，后续的刷新才能精准命中。
+            self.go_to_page(new_page)
+            
+            # 【修复 2：局部刷新】褪去旧的，点亮新的
+            if old_page is not None and old_page != new_page:
+                self.refresh_page_render(old_page)
+            self.refresh_page_render(new_page)
+
+    def refresh_page_render(self, page_num):
+        for p, lbl in self.page_labels:
+            if p == page_num:
+                lbl.setPixmap(self.get_page_pixmap(p))
+                # 【终极修复 3】：强迫 Qt 立刻重绘画板，无视任何性能优化策略！
+                lbl.repaint() 
+                break
 
     
 
-    # --- 渲染与导航 ---
+    # ==========================================
+    # --- 渲染与导航 (双模式兼容版) ---
+    # ==========================================
+    def toggle_view_mode(self):
+        if not self.doc: return
+        self.is_continuous_mode = not self.is_continuous_mode
+        self.btn_toggle_mode.setText('单页显示' if self.is_continuous_mode else '连续滚动')
+        self.setup_pages_layout()
+
+    def go_to_page(self, page_num):
+        """统一的页面跳转核心逻辑"""
+        if not self.doc or not (0 <= page_num < len(self.doc)): return
+        self.current_page = page_num
+        
+        if self.is_continuous_mode:
+            # 连续模式下不需要重新渲染，直接滚动到对应标签位置
+            for p, lbl in self.page_labels:
+                if p == self.current_page:
+                    self.scroll_area.verticalScrollBar().setValue(lbl.y())
+                    self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
+                    break
+        else:
+            # 单页模式下直接重新渲染该页
+            self.setup_pages_layout()
+
     def setup_pages_layout(self):
         if not self.doc: return
+        
         while self.pdf_layout.count():
             w = self.pdf_layout.takeAt(0).widget()
             if w: w.deleteLater()
         self.page_labels.clear()
         
-        lbl = SmartTextLabel(self.doc, self.current_page, self.zoom_factor)
-        lbl.setPixmap(self.get_page_pixmap(self.current_page))
-        self.pdf_layout.addWidget(lbl)
-        self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
+        if self.is_continuous_mode:
+            for p in range(len(self.doc)):
+                lbl = QLabel() # 【终极修复 4】：必须使用原生的纯净 QLabel
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setPixmap(self.get_page_pixmap(p))
+                self.pdf_layout.addWidget(lbl)
+                self.page_labels.append((p, lbl))
+            
+            self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
+            QTimer.singleShot(50, lambda: self.go_to_page(self.current_page))
+        else:
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setPixmap(self.get_page_pixmap(self.current_page))
+            self.pdf_layout.addWidget(lbl)
+            self.page_labels.append((self.current_page, lbl))
+            self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
+
+    def prev_page(self):
+        self.go_to_page(self.current_page - 1)
+
+    def next_page(self):
+        self.go_to_page(self.current_page + 1)
+
+    def jump_to_page_from_input(self):
+        text = self.page_jump_input.text()
+        if text.isdigit():
+            self.go_to_page(int(text) - 1)
+            self.page_jump_input.clear()
+            self.page_jump_input.clearFocus()
+
+    def handle_zoom(self, val):
+        self.zoom_factor = val / 100.0
+        self.setup_pages_layout()
+
+    def zoom_out_step(self):
+        self.zoom_slider.setValue(max(50, self.zoom_slider.value() - 10))
+
+    def zoom_in_step(self):
+        self.zoom_slider.setValue(min(400, self.zoom_slider.value() + 10))
 
     def get_page_pixmap(self, p_num):
         page = self.doc[p_num]
         temp_annots = []
         page_results = [res for res in self.search_results_data if res['page'] == p_num]
         
-        # 恢复之前完美的：同行融合抗重叠变深渲染逻辑
-        for res in page_results:
-            is_active = (self.active_data and self.active_data == res)
+        def draw_highlight(res_data, color):
             merged_rects = []
-            if res['rects']:
-                curr_rect = fitz.Rect(res['rects'][0])
-                for r in res['rects'][1:]:
+            if res_data.get('rects'):
+                curr_rect = fitz.Rect(res_data['rects'][0])
+                for r in res_data['rects'][1:]:
                     if curr_rect.y0 < r.y1 and curr_rect.y1 > r.y0:
-                        curr_rect |= r 
+                        curr_rect |= fitz.Rect(r) 
                     else:
                         merged_rects.append(curr_rect)
                         curr_rect = fitz.Rect(r)
@@ -615,62 +791,27 @@ class PDFReader(QMainWindow):
             if quads:
                 annot = page.add_highlight_annot(quads)
                 if annot:
-                    annot.set_colors(stroke=(1.0, 0.4, 0.0) if is_active else (1.0, 1.0, 0.0))
+                    annot.set_colors(stroke=color)
                     annot.update()
                     temp_annots.append(annot)
+
+        # 【终极修复 2】：提取当前激活项的唯一 ID
+        active_id = self.active_data['id'] if self.active_data else -1
+
+        for res in page_results:
+            if res['id'] == active_id: 
+                continue # 是激活项就跳过
+            draw_highlight(res, (1.0, 1.0, 0.0))
+
+        # 只针对 ID 完全吻合的目标橙色高亮
+        if self.active_data and self.active_data['page'] == p_num:
+            draw_highlight(self.active_data, (1.0, 0.4, 0.0))
                     
         pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom_factor, self.zoom_factor))
         for a in temp_annots: page.delete_annot(a)
         fmt = QImage.Format_RGBA8888 if pix.alpha else QImage.Format_RGB888
         return QPixmap.fromImage(QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy())
 
-    def prev_page(self):
-        if self.current_page > 0: self.current_page -= 1; self.setup_pages_layout()
-
-    def next_page(self):
-        if self.current_page < len(self.doc)-1: self.current_page += 1; self.setup_pages_layout()
-    
-    def prev_page(self):
-        if self.current_page > 0: 
-            self.current_page -= 1
-            self.setup_pages_layout()
-
-    def next_page(self):
-        if self.current_page < len(self.doc)-1: 
-            self.current_page += 1
-            self.setup_pages_layout()
-
-    # --- 【新增】：恢复页面跳转的逻辑代码 ---
-    def jump_to_page_from_input(self):
-        text = self.page_jump_input.text()
-        if not text.isdigit(): 
-            return
-        page_num = int(text) - 1 # 用户输入的是 1 开始的页码，程序底层是 0 开始的索引
-        
-        if self.doc and 0 <= page_num < len(self.doc):
-            self.current_page = page_num
-            self.setup_pages_layout()
-            self.page_jump_input.clear() # 跳转成功后清空输入框
-            self.page_jump_input.clearFocus()
-
-    # --- 【新增与修改】：精细缩放控制逻辑 ---
-    def zoom_out_step(self):
-        """点击减号按钮：缩小 5%"""
-        current_val = self.zoom_slider.value()
-        # 确保不会低于最小范围 50
-        self.zoom_slider.setValue(max(50, current_val - 5))
-
-    def zoom_in_step(self):
-        """点击加号按钮：放大 5%"""
-        current_val = self.zoom_slider.value()
-        # 确保不会超过最大范围 400
-        self.zoom_slider.setValue(min(400, current_val + 5))
-
-    def handle_zoom(self, val):
-        """滑块或按钮改变数值时触发的统一处理逻辑"""
-        # 因为滑块精度改成了 50~400，所以这里要除以 100.0 还原为真正的缩放倍率
-        self.zoom_factor = val / 100.0
-        self.setup_pages_layout()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
