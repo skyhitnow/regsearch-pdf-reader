@@ -12,7 +12,7 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from PyQt5.QtCore import Qt, QSettings,QTimer
 
 # ==========================================
-# 自定义标签类：实现字符级精准文本选择
+# 自定义标签类：实现字符级精准文本选择 (极限懒加载版)
 # ==========================================
 class SmartTextLabel(QLabel):
     def __init__(self, doc, page_num, zoom_factor, parent=None):
@@ -21,8 +21,14 @@ class SmartTextLabel(QLabel):
         self.page_num = page_num
         self.zoom_factor = zoom_factor
         self.chars = []
+        self.is_chars_loaded = False # 【新增】：标记是否已经提取过坐标
         
-        # 提取底层字符坐标
+        self.start_idx = None
+        self.current_idx = None
+
+    def load_chars_if_needed(self):
+        """【新增】：只有在需要选中文本时，才去解析这页的底层字符"""
+        if self.is_chars_loaded: return
         page_dict = self.doc[self.page_num].get_text("rawdict")
         for block in page_dict.get("blocks", []):
             if block.get("type") == 0:
@@ -30,9 +36,7 @@ class SmartTextLabel(QLabel):
                     for span in line.get("spans", []):
                         for c in span.get("chars", []):
                             self.chars.append({'rect': fitz.Rect(c['bbox']), 'c': c['c']})
-        
-        self.start_idx = None
-        self.current_idx = None
+        self.is_chars_loaded = True
 
     def get_closest_char_idx(self, x, y):
         if not self.chars: return None
@@ -51,6 +55,7 @@ class SmartTextLabel(QLabel):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self.load_chars_if_needed() # 【核心修复】：鼠标按下的瞬间才加载坐标！
             self.start_idx = self.get_closest_char_idx(event.pos().x(), event.pos().y())
             self.current_idx = self.start_idx
             self.update()
@@ -99,6 +104,11 @@ class PDFReader(QMainWindow):
         self.is_continuous_mode = False
         
         self.settings = QSettings("pdfsearch-config.ini", QSettings.IniFormat)
+        # 【新增】：用于缩放防抖的定时器
+        self.zoom_timer = QTimer()
+        self.zoom_timer.setSingleShot(True) # 设置为只触发一次
+        self.zoom_timer.timeout.connect(self.setup_pages_layout)
+
         self.page_labels = []
         self.rendered_pages = set()
         
@@ -252,8 +262,13 @@ class PDFReader(QMainWindow):
         self.pdf_layout = QVBoxLayout(self.pdf_container)
         self.pdf_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.scroll_area.setWidget(self.pdf_container)
+
+        # 【新增】：一旦滚动条被拖动，立刻触发可视范围检查
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_scroll_changed)
         
         center_layout.addWidget(self.scroll_area)
+
+
 
         # --- 3. 右侧面板：正则搜索 ---
         self.search_panel = QWidget()
@@ -261,7 +276,7 @@ class PDFReader(QMainWindow):
         search_layout.addWidget(QLabel("<b>正则搜索</b>"))
         
         self.search_combo = QComboBox()
-        self.search_combo.currentIndexChanged.connect(self.on_presets_selected)
+        self.search_combo.activated.connect(self.on_presets_selected)
         search_layout.addWidget(self.search_combo)
         
         reg_btn_layout = QHBoxLayout()
@@ -285,6 +300,8 @@ class PDFReader(QMainWindow):
         
         self.results_list = QListWidget()
         self.results_list.currentItemChanged.connect(self.on_result_change)
+        # 【新增下面这一行】：监听最原始的鼠标点击事件
+        self.results_list.itemClicked.connect(self.on_result_clicked)
         search_layout.addWidget(self.results_list)
 
         self.main_splitter.addWidget(self.bookmark_panel)
@@ -399,8 +416,10 @@ class PDFReader(QMainWindow):
     # --- 文件操作 ---
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "打开 PDF", "", "PDF (*.pdf)")
+
         if path:
-            if self.doc: self.doc.close()
+            # 清空当前文件状态
+            self.close_file()
             self.doc = fitz.open(path)
             self.current_page = 0
             
@@ -663,9 +682,24 @@ class PDFReader(QMainWindow):
                 res_id_counter += 1 # ID自增
 
         self.result_count_label.setText(f"共 {len(self.search_results_data)} 条结果")
-        self.setup_pages_layout()
+
+        # 【终极修复：绝对可靠的初始定位逻辑】
         if self.search_results_data:
+            # 1. 直接把第一条结果设为激活项，并更新当前页码
+            self.active_data = self.search_results_data[0]
+            self.current_page = self.active_data['page']
+            
+            # 2. 带着第一条的“橙色高亮”记忆，去执行排版和自动跳转
+            self.setup_pages_layout()
+            
+            # 3. 默默把右侧列表的第一行高亮选中，但堵住它的嘴（屏蔽信号）
+            # 防止它再次触发 on_result_change 导致页面被毫无意义地重绘两次
+            self.results_list.blockSignals(True)
             self.results_list.setCurrentRow(0)
+            self.results_list.blockSignals(False)
+        else:
+            # 如果没搜到东西，就按原样排版并清空高亮
+            self.setup_pages_layout()
 
     def on_result_change(self, cur, prev):
         if cur:
@@ -686,11 +720,24 @@ class PDFReader(QMainWindow):
                 self.refresh_page_render(old_page)
             self.refresh_page_render(new_page)
 
+    def on_result_clicked(self, item):
+        """专门处理鼠标重复点击同一条结果时的强行跳转"""
+        # 取出被点击的那一行的数据
+        res = self.search_results_data[self.results_list.row(item)]
+        
+        # 不管三七二十一，强行让画面切回这一页！
+        # （因为如果是同一条结果，深橙色高亮本身就还在它身上，不需要重新画，切过去就行）
+        self.go_to_page(res['page'])
+
     def refresh_page_render(self, page_num):
+        """极速局部刷新，兼顾剥离占位空壳的功能"""
         for p, lbl in self.page_labels:
             if p == page_num:
+                # 不管它是不是空壳，强制变回真图
+                lbl.setText("")
+                lbl.setStyleSheet("")
                 lbl.setPixmap(self.get_page_pixmap(p))
-                # 【终极修复 3】：强迫 Qt 立刻重绘画板，无视任何性能优化策略！
+                self.rendered_pages.add(p)
                 lbl.repaint() 
                 break
 
@@ -704,6 +751,53 @@ class PDFReader(QMainWindow):
         self.is_continuous_mode = not self.is_continuous_mode
         self.btn_toggle_mode.setText('单页显示' if self.is_continuous_mode else '连续滚动')
         self.setup_pages_layout()
+
+
+    
+    # ==========================================
+    # --- 懒加载 (按需渲染) 核心逻辑 ---
+    # ==========================================
+    def on_scroll_changed(self, value):
+        if self.is_continuous_mode:
+            self.render_visible_pages()
+            self.update_page_label_from_scroll()
+
+    def render_visible_pages(self):
+        """核心魔法：计算当前屏幕可见的页面，只渲染它们"""
+        if not self.is_continuous_mode or not self.doc: return
+        
+        # 获取当前可视区的顶部和底部 Y 坐标
+        scroll_y = self.scroll_area.verticalScrollBar().value()
+        viewport_height = self.scroll_area.viewport().height()
+        visible_start = scroll_y
+        visible_end = scroll_y + viewport_height
+        
+        # 上下多加载一页高度作为缓冲，防止滑动时有白底闪烁
+        buffer = viewport_height 
+        
+        for p, lbl in self.page_labels:
+            lbl_top = lbl.y()
+            lbl_bottom = lbl_top + lbl.height()
+            
+            # 判断这个标签是否进入了视野（或缓冲）范围
+            if lbl_bottom >= (visible_start - buffer) and lbl_top <= (visible_end + buffer):
+                if p not in self.rendered_pages:
+                    # 如果进入视野且没被渲染过，立刻撕掉空壳，画上真图！
+                    lbl.setText("") 
+                    lbl.setStyleSheet("") # 清除占位时的边框
+                    lbl.setPixmap(self.get_page_pixmap(p))
+                    self.rendered_pages.add(p)
+
+    def update_page_label_from_scroll(self):
+        """滚动时自动更新顶部工具栏的当前页码"""
+        scroll_y = self.scroll_area.verticalScrollBar().value()
+        for p, lbl in self.page_labels:
+            # 只要某页的一半已经越过了屏幕顶端，就认为正在看这一页
+            if lbl.y() + lbl.height() / 2 > scroll_y:
+                if self.current_page != p:
+                    self.current_page = p
+                    self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
+                break
 
     def go_to_page(self, page_num):
         """统一的页面跳转核心逻辑"""
@@ -727,20 +821,36 @@ class PDFReader(QMainWindow):
         while self.pdf_layout.count():
             w = self.pdf_layout.takeAt(0).widget()
             if w: w.deleteLater()
+            
         self.page_labels.clear()
+        self.rendered_pages.clear() # 【重要】：重新布局时清空已渲染记录
         
         if self.is_continuous_mode:
+            # --- 连续模式：极速生成占位骨架 ---
             for p in range(len(self.doc)):
-                lbl = QLabel() # 【终极修复 4】：必须使用原生的纯净 QLabel
+                lbl = SmartTextLabel(self.doc, p, self.zoom_factor)
                 lbl.setAlignment(Qt.AlignCenter)
-                lbl.setPixmap(self.get_page_pixmap(p))
+                
+                # 提前计算这一页在当前缩放比下的物理尺寸
+                page_rect = self.doc[p].rect
+                width = int(page_rect.width * self.zoom_factor)
+                height = int(page_rect.height * self.zoom_factor)
+                
+                # 生成占位空壳
+                lbl.setFixedSize(width, height)
+                lbl.setStyleSheet("background-color: #ffffff; border: 1px solid #cccccc; color: #999999; font-size: 16px;")
+                lbl.setText(f"加载中... P{p+1}")
+                
                 self.pdf_layout.addWidget(lbl)
                 self.page_labels.append((p, lbl))
             
             self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
+            
+            # 等待骨架生成后，直接跳转到当前页（这会触发滚动条变化，进而激活懒加载）
             QTimer.singleShot(50, lambda: self.go_to_page(self.current_page))
         else:
-            lbl = QLabel()
+            # --- 单页模式保持不变 ---
+            lbl = SmartTextLabel(self.doc, self.current_page, self.zoom_factor)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setPixmap(self.get_page_pixmap(self.current_page))
             self.pdf_layout.addWidget(lbl)
@@ -762,7 +872,10 @@ class PDFReader(QMainWindow):
 
     def handle_zoom(self, val):
         self.zoom_factor = val / 100.0
-        self.setup_pages_layout()
+        
+        # 以前是直接调用 self.setup_pages_layout()，太暴力了
+        # 现在改成：重置并启动定时器，等待 500 毫秒
+        self.zoom_timer.start(500)
 
     def zoom_out_step(self):
         self.zoom_slider.setValue(max(50, self.zoom_slider.value() - 10))

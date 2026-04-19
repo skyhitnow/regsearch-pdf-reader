@@ -2,3 +2,6 @@
 build
 dist
 pdfsearch.spec
+icogenerate.py
+icon.png
+app_icon.ico
