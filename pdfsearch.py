@@ -6,7 +6,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QLabel, 
                              QScrollArea, QFileDialog, QMessageBox, QSplitter, 
                              QSlider, QComboBox, QInputDialog, QLineEdit, QAction, 
-                             QTreeWidgetItem, QTreeWidget) #
+                             QTreeWidgetItem, QTreeWidget,
+                             QDialog, QFormLayout, QDialogButtonBox) # <--- 新增这三个
 
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from PyQt5.QtCore import Qt, QSettings,QTimer
@@ -88,6 +89,48 @@ class SmartTextLabel(QLabel):
                 painter.drawRect(int(r.x0 * z), int(r.y0 * z), int((r.x1 - r.x0) * z), int((r.y1 - r.y0) * z))
 
 # ==========================================
+# 自定义对话框：用于输入页面重排规则
+# ==========================================
+class MovePagesDialog(QDialog):
+    def __init__(self, max_pages, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("重排页面")
+        self.resize(300, 150)
+        layout = QFormLayout(self)
+
+        self.input_pages = QLineEdit()
+        self.input_pages.setPlaceholderText("例如: 1, 3-5")
+        layout.addRow("要剪切的页码:", self.input_pages)
+
+        self.input_target = QLineEdit()
+        self.input_target.setPlaceholderText(f"1 - {max_pages+1} (数字代表插入到该页之前)")
+        layout.addRow("插入到哪一页之前:", self.input_target)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addRow(self.buttons)
+
+# ==========================================
+# 自定义对话框：用于输入要删除的页码
+# ==========================================
+class DeletePagesDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("删除页面")
+        self.resize(300, 100)
+        layout = QFormLayout(self)
+
+        self.input_pages = QLineEdit()
+        self.input_pages.setPlaceholderText("例如: 2, 5-8 (指PDF显示的页码)")
+        layout.addRow("要删除的页码:", self.input_pages)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addRow(self.buttons)
+
+# ==========================================
 # 主程序
 # ==========================================
 class PDFReader(QMainWindow):
@@ -99,6 +142,8 @@ class PDFReader(QMainWindow):
         self.search_results_data = []
         self.active_data = None
         self.all_bookmarks = [] 
+
+        self.is_modified = False # 新增：标记文件是否被修改过
 
         # 【新增】：模式切换状态
         self.is_continuous_mode = False
@@ -154,6 +199,17 @@ class PDFReader(QMainWindow):
         find_act.setShortcut('Ctrl+F') # 绑定在这，绝对有效
         find_act.triggered.connect(self.focus_search_box)
         edit_menu.addAction(find_act)
+
+        # 3. 【新增】：文档菜单（专门处理页面操作）
+        doc_menu = menubar.addMenu('文档')
+        move_act = QAction('重新排列页面', self)
+        move_act.triggered.connect(self.show_move_pages_dialog)
+        doc_menu.addAction(move_act)
+
+        # 【新增】：删除页面动作
+        delete_act = QAction('删除指定页面', self)
+        delete_act.triggered.connect(self.show_delete_pages_dialog)
+        doc_menu.addAction(delete_act)
 
         # 主布局使用 Splitter
         self.main_splitter = QSplitter(Qt.Horizontal)
@@ -371,6 +427,7 @@ class PDFReader(QMainWindow):
         self.all_bookmarks.append({"name": new_name, "page": self.current_page})
         self.sync_bookmarks_to_doc()
         self.render_bookmark_list()
+        self.is_modified = True
         
         # 找到刚刚新增的那一行（最后一行），并用代码模拟双击，强制它立刻进入输入状态！
         last_item = self.bookmark_tree.topLevelItem(self.bookmark_tree.topLevelItemCount() - 1)
@@ -393,6 +450,7 @@ class PDFReader(QMainWindow):
             if self.all_bookmarks[idx]['name'] != new_name:
                 self.all_bookmarks[idx]['name'] = new_name
                 self.sync_bookmarks_to_doc()
+                self.is_modified = True # <--- 加入这行
 
     def delete_bookmark(self):
         if not self.doc: return
@@ -402,6 +460,7 @@ class PDFReader(QMainWindow):
             del self.all_bookmarks[idx]
             self.sync_bookmarks_to_doc()
             self.render_bookmark_list()
+            self.is_modified = True
 
     def on_bookmark_clicked(self, item, column):
             """单击条目立刻跳转"""
@@ -417,10 +476,15 @@ class PDFReader(QMainWindow):
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "打开 PDF", "", "PDF (*.pdf)")
 
+        # 如果用户在处理旧文件保存提醒时点了“取消”，这里就直接返回，不打开新文件
+        if not self.close_file():
+            return
+
         if path:
             # 清空当前文件状态
             self.close_file()
             self.doc = fitz.open(path)
+            self.is_modified = False # 确保新打开的文件状态是干净的
             self.current_page = 0
             
             # 【重要】：打开文件后立刻从 PDF 读取它原生的书签
@@ -430,38 +494,55 @@ class PDFReader(QMainWindow):
             self.setWindowTitle(f"高级正则 PDF 阅读器 - {os.path.basename(path)}")
 
     def close_file(self):
-        """关闭当前文档并彻底清空所有相关的 UI 和底层数据"""
+        """关闭文件，若有修改则提醒保存"""
+        if self.doc and self.is_modified:
+            reply = QMessageBox.question(self, '确认关闭',
+                                         "文档已修改，是否保存更改？",
+                                         QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                         QMessageBox.Save)
+            
+            if reply == QMessageBox.Save:
+                self.direct_save()
+                # 如果保存后依然是 modified (可能保存失败或用户取消了另存为)，则停止关闭
+                if self.is_modified: return False
+            elif reply == QMessageBox.Cancel:
+                return False
+            # 如果是 Discard (不保存)，则继续往下走执行清理逻辑
+
+        # --- 以下是原有的清理逻辑 ---
         if self.doc:
             self.doc.close()
             self.doc = None
             
-        # 1. 重置窗口标题和页码信息
         self.setWindowTitle('高级正则 PDF 阅读器')
         self.current_page = 0
         self.page_label.setText('第 0 / 0 页')
-        if hasattr(self, 'page_jump_input'):
-            self.page_jump_input.clear()
-
-        # 2. 彻底清空书签相关内容
+        self.is_modified = False # 重置状态
+        
         self.all_bookmarks = []            
         self.bookmark_tree.clear()         
         self.bookmark_search.clear()       
 
-        # 3. 【核心修复】：彻底清空正则搜索相关的 UI 与 底层数据
         self.results_list.clear()
         self.result_count_label.setText('共 0 条结果')
-        self.search_results_data = []      # <--- 就是漏了这一行！必须清空旧坐标！
+        self.search_results_data = []      
         self.active_data = None
-        self.current_regex_input.clear()   # 顺手把搜索框里的字也清掉，保持界面整洁
-        
-        # 4. 清空中间 PDF 渲染视图
+        # self.current_regex_input.clear() # 根据之前的讨论，这里不建议清空
+
         while self.pdf_layout.count():
             item = self.pdf_layout.takeAt(0)
-            if item.widget(): 
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
                 
         self.page_labels.clear()
         self.rendered_pages.clear()
+        return True # 表示成功关闭
+    
+    def closeEvent(self, event):
+        """拦截窗口关闭按钮"""
+        if self.close_file():
+            event.accept()
+        else:
+            event.ignore()
 
     def direct_save(self):
         """【直接保存】：不弹出对话框，直接将书签写入当前打开的 PDF"""
@@ -476,6 +557,7 @@ class PDFReader(QMainWindow):
             # 使用增量保存 (incremental=True) 直接覆盖原文件
             # 这种方式速度最快，且不需要关闭文件流
             self.doc.save(self.doc.name, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+            self.is_modified = False
             
             # 在状态栏或通过弹窗提示（为了不打断思路，这里用状态栏提示更好，如果没有状态栏就用短暂弹窗）
             QMessageBox.information(self, "保存成功", "更改已保存至原文件。")
@@ -493,9 +575,141 @@ class PDFReader(QMainWindow):
                 self.sync_bookmarks_to_doc()
                 # 另存为通常不需要增量保存，直接全量写入即可
                 self.doc.save(path)
+                self.is_modified = False
                 QMessageBox.information(self, "成功", "文件已另存为新路径。")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"另存为失败: {str(e)}")
+    
+    # --- 页面重排逻辑 ---
+    def show_move_pages_dialog(self):
+        if not self.doc: return
+        dialog = MovePagesDialog(len(self.doc), self)
+        if dialog.exec_() == QDialog.Accepted:
+            pages_str = dialog.input_pages.text()
+            target_str = dialog.input_target.text()
+            self.execute_move_pages(pages_str, target_str)
+
+    def execute_move_pages(self, pages_str, target_str):
+        try:
+            max_p = len(self.doc)
+            
+            # 1. 智能解析要剪切的页码 (支持 "1, 3-5" 格式)
+            cut_pages = set()
+            for part in pages_str.split(','):
+                part = part.strip()
+                if not part: continue
+                if '-' in part:
+                    s, e = part.split('-')
+                    for p in range(int(s)-1, int(e)):
+                        if 0 <= p < max_p: cut_pages.add(p)
+                else:
+                    p = int(part) - 1
+                    if 0 <= p < max_p: cut_pages.add(p)
+
+            cut_list = sorted(list(cut_pages))
+            if not cut_list: return
+
+            # 2. 解析目标位置 (转为从 0 开始的索引)
+            target_page = int(target_str.strip()) - 1
+            if target_page < 0: target_page = 0
+            
+            # 3. 构建全新的 PDF 顺序序列
+            new_seq = []
+            for i in range(max_p):
+                # 到了目标位置，先一口气把剪切的页面塞进去
+                if i == target_page:
+                    new_seq.extend(cut_list)
+                # 只要没被剪切走，就按原顺序放进去
+                if i not in cut_pages:
+                    new_seq.append(i)
+
+            # 如果目标位置写得很大（超出了原来的页数），就追加在最末尾
+            if target_page >= max_p:
+                new_seq.extend(cut_list)
+
+            # 4. 【上帝模式】：一键重组整个 PDF
+            self.doc.select(new_seq)
+
+
+            self.is_modified = True
+
+            # 5. 清理与重绘，防止旧搜索框或书签引发错乱
+            self.search_results_data.clear()
+            self.results_list.clear()
+            self.result_count_label.setText("共 0 条结果")
+            self.active_data = None
+            
+            self.setup_pages_layout()
+            QMessageBox.information(self, "成功", "页面已成功重新排列！\n记得点击 '文件 -> 保存' 进行持久化保存。")
+
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"输入的格式不正确或发生错误:\n{str(e)}")
+
+    
+    # --- 删除页面逻辑 ---
+    def show_delete_pages_dialog(self):
+        if not self.doc: return
+        dialog = DeletePagesDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            pages_str = dialog.input_pages.text()
+            self.execute_delete_pages(pages_str)
+
+    def execute_delete_pages(self, pages_str):
+        try:
+            max_p = len(self.doc)
+            
+            # 1. 解析要删除的页码
+            to_delete = set()
+            for part in pages_str.split(','):
+                part = part.strip()
+                if not part: continue
+                if '-' in part:
+                    s, e = part.split('-')
+                    for p in range(int(s)-1, int(e)):
+                        if 0 <= p < max_p: to_delete.add(p)
+                else:
+                    p = int(part) - 1
+                    if 0 <= p < max_p: to_delete.add(p)
+
+            if not to_delete: return
+
+            # 2. 确认提示：防止误删
+            reply = QMessageBox.question(self, '确认删除', 
+                                         f'确定要永久删除这 {len(to_delete)} 页吗？\n该操作不可撤销（除非不保存直接关闭）。',
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes: return
+
+            # 3. 计算“幸存”的页面序列
+            # 逻辑：遍历所有页码，如果不在删除集合里，就保留
+            new_seq = [i for i in range(max_p) if i not in to_delete]
+
+            if not new_seq:
+                QMessageBox.warning(self, "错误", "不能删除所有页面！至少需要保留一页。")
+                return
+
+            # 4. 执行重组（即删除）
+            self.doc.select(new_seq)
+
+            self.is_modified = True
+
+            # 5. 状态清理与强制重绘
+            # 如果当前页被删了，将指针移动到最后有效页
+            if self.current_page >= len(self.doc):
+                self.current_page = len(self.doc) - 1
+            
+            self.search_results_data.clear()
+            self.results_list.clear()
+            self.result_count_label.setText("共 0 条结果")
+            self.active_data = None
+            
+            # 重新加载布局和书签（因为页码变了，书签可能需要重新同步）
+            self.load_bookmarks()
+            self.setup_pages_layout()
+            
+            QMessageBox.information(self, "成功", f"已成功删除 {len(to_delete)} 页！")
+
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"解析页码出错:\n{str(e)}")
 
     # --- 搜索逻辑 ---
     def load_presets(self):
@@ -845,9 +1059,10 @@ class PDFReader(QMainWindow):
                 self.page_labels.append((p, lbl))
             
             self.page_label.setText(f"第 {self.current_page+1} / {len(self.doc)} 页")
-            
-            # 等待骨架生成后，直接跳转到当前页（这会触发滚动条变化，进而激活懒加载）
-            QTimer.singleShot(50, lambda: self.go_to_page(self.current_page))
+
+            # 【核心修复】：将原本的 50ms 延长至 100ms 给排版引擎喘息时间，
+            # 并在跳转后，强行追加一次 render_visible_pages() 撕掉可视区域的空壳！
+            QTimer.singleShot(100, lambda: (self.go_to_page(self.current_page), self.render_visible_pages()))
         else:
             # --- 单页模式保持不变 ---
             lbl = SmartTextLabel(self.doc, self.current_page, self.zoom_factor)
